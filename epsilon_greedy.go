@@ -23,6 +23,8 @@ func (r *epsilonHostPoolResponse) Mark(err error) {
 type epsilonGreedyHostPool struct {
 	standardHostPool               // TODO - would be nifty if we could embed HostPool and Locker interfaces
 	epsilon                float32 // this is our exploration factor
+	responseIndex          int
+	responseValues         []float64
 	decayDuration          time.Duration
 	EpsilonValueCalculator // embed the epsilonValueCalculator
 	timer
@@ -52,6 +54,7 @@ func NewEpsilonGreedy(hosts []string, decayDuration time.Duration, calc EpsilonV
 		standardHostPool:       *stdHP,
 		epsilon:                float32(initialEpsilon),
 		decayDuration:          decayDuration,
+		responseValues:         make([]float64, epsilonBuckets),
 		EpsilonValueCalculator: calc,
 		timer: &realTimer{},
 	}
@@ -79,15 +82,44 @@ func (p *epsilonGreedyHostPool) epsilonGreedyDecay() {
 		p.performEpsilonGreedyDecay()
 	}
 }
+
 func (p *epsilonGreedyHostPool) performEpsilonGreedyDecay() {
 	p.Lock()
+	var avgResponse float64
 	for _, h := range p.hostList {
+		avgResponse += float64(h.epsilonValues[h.epsilonIndex]) / float64(h.epsilonCounts[h.epsilonIndex])
 		h.epsilonIndex += 1
 		h.epsilonIndex = h.epsilonIndex % epsilonBuckets
 		h.epsilonCounts[h.epsilonIndex] = 0
 		h.epsilonValues[h.epsilonIndex] = 0
 	}
+	p.responseValues[p.responseIndex] = avgResponse / float64(len(p.hostList))
+	p.responseIndex += 1
+	p.responseIndex = p.responseIndex % epsilonBuckets
+	p.responseValues[p.responseIndex] = 0
 	p.Unlock()
+}
+
+func (p *epsilonGreedyHostPool) getGlobalAverageResponseTime() float64 {
+	var bucketCount int
+	var value float64
+
+	// start at 1 so we start with the oldest entry
+	for i := 1; i <= epsilonBuckets; i += 1 {
+		pos := (p.responseIndex + i) % epsilonBuckets
+		bucketValue := p.responseValues[pos]
+		// Changing the line below to what I think it should be to get the weights right
+		weight := float64(i) / float64(epsilonBuckets)
+		if bucketValue > 0 {
+			value += bucketValue * weight
+			bucketCount += 1
+		}
+	}
+
+	if bucketCount == 0 {
+		return 0.0
+	}
+	return value / float64(bucketCount)
 }
 
 func (p *epsilonGreedyHostPool) Get() HostPoolResponse {
@@ -103,6 +135,15 @@ func (p *epsilonGreedyHostPool) Get() HostPoolResponse {
 
 func (p *epsilonGreedyHostPool) getEpsilonGreedy() string {
 	var hostToUse *hostEntry
+
+	// we want to penalize system response time above a certain value
+	passPct := rand.Float64()
+	if response := p.getGlobalAverageResponseTime(); response != 0 {
+		// we should throw out bids based on how close it is to 50ms
+		if passPct <= (response / 50.0) {
+			return ""
+		}
+	}
 
 	// this is our exploration phase
 	if rand.Float32() < p.epsilon {
@@ -148,10 +189,11 @@ func (p *epsilonGreedyHostPool) getEpsilonGreedy() string {
 	}
 
 	if hostToUse == nil {
-		if len(possibleHosts) != 0 {
-			log.Println("Failed to randomly choose a host, Dan loses")
-		}
-		return p.getRoundRobin()
+		/*if len(possibleHosts) != 0 {*/
+		/*log.Println("Failed to randomly choose a host, Dan loses")*/
+		/*}*/
+		/*return p.getRoundRobin()*/
+		return ""
 	}
 
 	if hostToUse.dead {
