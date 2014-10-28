@@ -139,8 +139,8 @@ func (p *epsilonGreedyHostPool) getEpsilonGreedy() string {
 	// we want to penalize system response time above a certain value
 	passPct := rand.Float64()
 	if response := p.getGlobalAverageResponseTime(); response != 0 {
-		// we should throw out bids based on how close it is to 50ms
-		if passPct <= (response / 50.0) {
+		// we should throw out bids based on how close it is to 30ms
+		if passPct <= (response / 30.0) {
 			return ""
 		}
 	}
