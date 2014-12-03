@@ -1,12 +1,15 @@
 package hostpool
 
 import (
+	"bytes"
 	"encoding/gob"
 	"fmt"
 	"log"
 	"math"
 	"math/rand"
+	"net"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -54,6 +57,9 @@ func NewCached(hosts []string, fname string, targetLoad float64, maxResponse flo
 	}
 	err := p.Load(fname)
 
+	// spawn off goroutine to check cluster health
+	go p.checkHostHealth()
+
 	go func() {
 		durationPerBucket := tickerDuration / epsilonBuckets
 		ticker := time.Tick(durationPerBucket)
@@ -83,7 +89,7 @@ func NewCached(hosts []string, fname string, targetLoad float64, maxResponse flo
 			// if the load function is > 1
 			// we should enter an exploration phase for the targetload
 			// what we want to do here i
-			fmt.Printf("Pool debug: Index %d calculated load %f\n", p.index, p.clusterLoad)
+			fmt.Printf("Pool debug: Index %d calculated load %f with %d responses\n", p.index, p.clusterLoad, p.responseCount)
 
 			p.index++
 			p.index = p.index % epsilonBuckets
@@ -94,6 +100,51 @@ func NewCached(hosts []string, fname string, targetLoad float64, maxResponse flo
 	}()
 
 	return p, err
+}
+
+func (p *cachedHostPool) checkHostHealth() {
+	typ := icmpv4EchoRequest
+	xid, xseq := rand.Intn(0xffff), rand.Intn(0xffff)
+	wb, _ := (&icmpMessage{
+		Type: typ, Code: 0,
+		Body: &icmpEcho{
+			ID: xid, Seq: xseq,
+			Data: bytes.Repeat([]byte("ping!"), 3),
+		},
+	}).Marshal()
+	rb := make([]byte, 20+len(wb))
+	ticker := time.Tick(20 * time.Second)
+
+	for {
+		<-ticker
+		for _, h := range p.hostList {
+			c, err := net.Dial("ip4:icmp", strings.Split(h.host, ":")[0])
+			if err != nil {
+				continue
+			}
+			c.SetDeadline(time.Now().Add(10 * time.Millisecond))
+
+			if _, err := c.Write(wb); err != nil {
+				continue
+			}
+
+			if _, err := c.Read(rb); err != nil {
+				if err.(net.Error).Timeout() {
+					// timedout, mark remote as dead
+					p.Lock()
+					if !h.dead {
+						h.dead = true
+						h.retryCount = 0
+						h.retryDelay = p.initialRetryDelay
+						h.nextRetry = time.Now().Add(h.retryDelay)
+					}
+					p.Unlock()
+				}
+				log.Printf("Conn.Read failed for bidder %s: %v", h.host, err)
+			}
+			c.Close()
+		}
+	}
 }
 
 func (p *cachedHostPool) getClusterResponseTime() float64 {
@@ -173,11 +224,11 @@ func (p *cachedHostPool) Save(fname string) (err error) {
 	}
 
 	err = enc.Encode(p.index)
-    if err != nil {
-        return err
-    }
+	if err != nil {
+		return err
+	}
 
-    return enc.Encode(p.nextHostIndex)
+	return enc.Encode(p.nextHostIndex)
 }
 
 func (p *cachedHostPool) Load(fname string) (err error) {
@@ -204,9 +255,9 @@ func (p *cachedHostPool) Load(fname string) (err error) {
 	}
 
 	err = dec.Decode(&p.index)
-    if err != nil {
-        return
-    }
+	if err != nil {
+		return
+	}
 
-    return dec.Decode(&p.nextHostIndex)
+	return dec.Decode(&p.nextHostIndex)
 }
