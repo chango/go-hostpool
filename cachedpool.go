@@ -45,6 +45,11 @@ type cachedHostPool struct {
 // make sure cachedHostPool implements interface
 var _ cached = &cachedHostPool{}
 
+/* Cached hostpool keeps a rolling weighted average of
+* cluster response time. Compare this response time
+* to a max response time to obtain a "load score". The load
+* score is then optimized towards a target load.
+ */
 func NewCached(hosts []string, fname string, targetLoad float64, maxResponse float64, tickerDuration time.Duration, maxLifespan time.Duration) (HostPool, error) {
 	stdHP := New(hosts).(*standardHostPool)
 	p := &cachedHostPool{
@@ -58,20 +63,22 @@ func NewCached(hosts []string, fname string, targetLoad float64, maxResponse flo
 	err := p.Load(fname)
 
 	// spawn off goroutine to check cluster health
+	// see function comment for detail
 	go p.checkHostHealth()
 
 	go func() {
+		// obtain per bucket duration
 		durationPerBucket := tickerDuration / epsilonBuckets
 		ticker := time.Tick(durationPerBucket)
 		for {
 			<-ticker
-			// rotate the bucket and write
-			// and then to disk every cycle
+			// ignore zero values
 			if p.responseCount == 0 || p.responseValue == 0 {
 				continue
 			}
-			// calculate and store weighting
+			// calculate the average response time of cluster
 			p.cache[p.index] = p.responseValue / p.responseCount
+			// cache to disk every so often
 			if p.index%10 == 0 {
 				err := p.Save(fname)
 				if err != nil {
@@ -79,18 +86,20 @@ func NewCached(hosts []string, fname string, targetLoad float64, maxResponse flo
 				}
 			}
 
-			// recalculate the cluster average
+			// recalculate the weighted cluster average and load score
 			p.clusterLoad = p.getClusterResponseTime() / p.maxResponse
 
 			// simple function to optimize the clusterLoad towards the
 			// target load specified. See comment for ShouldPassthru for detail
-			// we will set the max rejection at 80% of the traffic
+			// set the max rejection at 80% of the traffic to avoid
+			// blocking all traffic
 			p.clusterLoad = math.Min(2*p.clusterLoad-targetLoad, 0.80)
-			// if the load function is > 1
-			// we should enter an exploration phase for the targetload
-			// what we want to do here i
+			// TODO: If the load function is > 1
+			// should enter an exploration phase for the targetload
+			// and dynamically modify it
 			fmt.Printf("Pool debug: Index %d calculated load %f with %d responses\n", p.index, p.clusterLoad, p.responseCount)
 
+			// rotate the bucket and reset values
 			p.index++
 			p.index = p.index % epsilonBuckets
 			p.cache[p.index] = 0
@@ -102,6 +111,11 @@ func NewCached(hosts []string, fname string, targetLoad float64, maxResponse flo
 	return p, err
 }
 
+// Function to ping the cluster every 20s to make sure the
+// hosts are alive. Unless a host is dead, it shouldn't
+// be taken out of the rotation. A non responding webserver can
+// be quickly restarted, a dead machine is more difficult to handle.
+// Code modified from http://golang.org/src/pkg/net/ipraw_test.go
 func (p *cachedHostPool) checkHostHealth() {
 	typ := icmpv4EchoRequest
 	xid, xseq := rand.Intn(0xffff), rand.Intn(0xffff)
@@ -147,6 +161,7 @@ func (p *cachedHostPool) checkHostHealth() {
 	}
 }
 
+// weighted average of clustser response time
 func (p *cachedHostPool) getClusterResponseTime() float64 {
 	var bucketCount float64
 	var value float64
